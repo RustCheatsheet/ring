@@ -232,16 +232,35 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test_configure!(run_in_browser);
 
-    #[test]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
-    fn chacha20_test_default() {
-        chacha20_test(Key::encrypt_within);
-    }
+    const MAX_ALIGNMENT_AND_OFFSET: (usize, usize) = (15, 259);
+    const MAX_ALIGNMENT_AND_OFFSET_SUBSET: (usize, usize) =
+        if cfg!(any(debug_assertions = "false", feature = "slow_tests")) {
+            MAX_ALIGNMENT_AND_OFFSET
+        } else {
+            (0, 0)
+        };
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn chacha20_test_default() {
+        // Always use `MAX_OFFSET` if we hav assembly code.
+        let max_offset = if cfg!(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )) {
+            MAX_ALIGNMENT_AND_OFFSET
+        } else {
+            MAX_ALIGNMENT_AND_OFFSET_SUBSET
+        };
+        chacha20_test(max_offset, Key::encrypt_within);
+    }
+
+    // Smoketest the fallback implementation.
+    #[test]
     fn chacha20_test_fallback() {
-        chacha20_test(fallback::chacha20_ctr32);
+        chacha20_test(MAX_ALIGNMENT_AND_OFFSET_SUBSET, fallback::chacha20_ctr32);
     }
 
     // Verifies the encryption is successful when done on overlapping buffers.
@@ -251,7 +270,10 @@ mod tests {
     // not exactly overlapping. Such failures are dependent not only on the
     // degree of overlapping but also the length of the data. `encrypt_within`
     // works around that.
-    fn chacha20_test(f: impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>)) {
+    fn chacha20_test(
+        max_alignment_and_offset: (usize, usize),
+        f: impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>),
+    ) {
         // Reuse a buffer to avoid slowing down the tests with allocations.
         let mut buf = vec![0u8; 1300];
 
@@ -278,6 +300,7 @@ mod tests {
                     &input[..len],
                     &output[..len],
                     &mut buf,
+                    max_alignment_and_offset,
                     &f,
                 );
             }
@@ -293,14 +316,15 @@ mod tests {
         input: &[u8],
         expected: &[u8],
         buf: &mut [u8],
+        (max_alignment, max_offset): (usize, usize),
         f: &impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>),
     ) {
         const ARBITRARY: u8 = 123;
 
-        for alignment in 0..16 {
+        for alignment in 0..=max_alignment {
             polyfill::slice::fill(&mut buf[..alignment], ARBITRARY);
             let buf = &mut buf[alignment..];
-            for offset in 0..=259 {
+            for offset in 0..=max_offset {
                 let buf = &mut buf[..(offset + input.len())];
                 polyfill::slice::fill(&mut buf[..offset], ARBITRARY);
                 let src = offset..;
