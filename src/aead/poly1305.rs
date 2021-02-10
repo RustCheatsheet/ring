@@ -135,8 +135,15 @@ mod tests {
     use crate::test;
     use core::convert::TryInto;
 
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test_configure!(run_in_browser);
+
     // Adapted from BoringSSL's crypto/poly1305/poly1305_test.cc.
     #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     pub fn test_poly1305() {
         let cpu_features = cpu::features();
         test::run(test_file!("poly1305_test.txt"), |section, test_case| {

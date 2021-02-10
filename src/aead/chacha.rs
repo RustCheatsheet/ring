@@ -13,8 +13,20 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::quic::Sample;
-use crate::{aead::Nonce, c, polyfill::ChunksFixed};
+use super::{quic::Sample, Nonce};
+use crate::polyfill::ChunksFixed;
+
+#[cfg(any(
+    test,
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64"
+    ))
+))]
+mod fallback;
+
 use core::ops::RangeFrom;
 
 #[repr(transparent)]
@@ -83,31 +95,58 @@ impl Key {
     /// Only call this with `src` equal to `0..` or from `encrypt_within`.
     #[inline]
     fn encrypt_less_safe(&self, counter: Counter, in_out: &mut [u8], src: RangeFrom<usize>) {
-        let in_out_len = in_out.len().checked_sub(src.start).unwrap();
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        ))]
+        #[inline(always)]
+        pub(super) fn chacha20_ctr32(
+            key: &Key,
+            counter: Counter,
+            in_out: &mut [u8],
+            src: RangeFrom<usize>,
+        ) {
+            let in_out_len = in_out.len().checked_sub(src.start).unwrap();
 
-        // There's no need to worry if `counter` is incremented because it is
-        // owned here and we drop immediately after the call.
-        extern "C" {
-            fn GFp_ChaCha20_ctr32(
-                out: *mut u8,
-                in_: *const u8,
-                in_len: c::size_t,
-                key: &Key,
-                counter: &Counter,
-            );
+            // There's no need to worry if `counter` is incremented because it is
+            // owned here and we drop immediately after the call.
+            extern "C" {
+                fn GFp_ChaCha20_ctr32(
+                    out: *mut u8,
+                    in_: *const u8,
+                    in_len: crate::c::size_t,
+                    key: &Key,
+                    counter: &Counter,
+                );
+            }
+            unsafe {
+                GFp_ChaCha20_ctr32(
+                    in_out.as_mut_ptr(),
+                    in_out[src].as_ptr(),
+                    in_out_len,
+                    key,
+                    &counter,
+                )
+            }
         }
-        unsafe {
-            GFp_ChaCha20_ctr32(
-                in_out.as_mut_ptr(),
-                in_out[src].as_ptr(),
-                in_out_len,
-                self,
-                &counter,
-            );
-        }
+
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        use fallback::chacha20_ctr32;
+
+        chacha20_ctr32(self, counter, in_out, src);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(
+        test,
+        not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86"))
+    ))]
     #[inline]
     pub(super) fn words_less_safe(&self) -> &[u32; KEY_LEN / 4] {
         &self.0
@@ -137,6 +176,21 @@ impl Counter {
         let iv = Iv(self.0);
         self.0[0] += 1;
         iv
+    }
+
+    /// This is "less safe" because it hands off management of the counter to
+    /// the caller.
+    #[cfg(any(
+        test,
+        not(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        ))
+    ))]
+    fn into_words_less_safe(self) -> [u32; 4] {
+        self.0
     }
 }
 
@@ -172,6 +226,24 @@ mod tests {
     use alloc::vec;
     use core::convert::TryInto;
 
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn chacha20_test_default() {
+        chacha20_test(Key::encrypt_within);
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn chacha20_test_fallback() {
+        chacha20_test(fallback::chacha20_ctr32);
+    }
+
     // Verifies the encryption is successful when done on overlapping buffers.
     //
     // On some branches of the 32-bit x86 and ARM assembly code the in-place
@@ -179,8 +251,7 @@ mod tests {
     // not exactly overlapping. Such failures are dependent not only on the
     // degree of overlapping but also the length of the data. `encrypt_within`
     // works around that.
-    #[test]
-    pub fn chacha20_tests() {
+    fn chacha20_test(f: impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>)) {
         // Reuse a buffer to avoid slowing down the tests with allocations.
         let mut buf = vec![0u8; 1300];
 
@@ -207,6 +278,7 @@ mod tests {
                     &input[..len],
                     &output[..len],
                     &mut buf,
+                    &f,
                 );
             }
 
@@ -221,6 +293,7 @@ mod tests {
         input: &[u8],
         expected: &[u8],
         buf: &mut [u8],
+        f: &impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>),
     ) {
         const ARBITRARY: u8 = 123;
 
@@ -237,7 +310,7 @@ mod tests {
                     Nonce::try_assume_unique_for_key(nonce).unwrap(),
                     ctr,
                 );
-                key.encrypt_within(ctr, buf, src);
+                f(key, ctr, buf, src);
                 assert_eq!(&buf[..input.len()], expected)
             }
         }
